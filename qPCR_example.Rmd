@@ -1,0 +1,247 @@
+---
+title: "qPCR of Sone Genes"
+author: "Philip"
+date: "October 28, 2020"
+output: html_document
+---
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("HTqPCR")
+
+Undetermiend replaced with NA in the CSV, dilution column also added before importing.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(broom)
+
+## Data
+read.csv("eff_data_exp.csv", header = TRUE) -> eff_data
+
+read.csv("example_data.csv", header = TRUE) -> raw_CT
+
+## Name of control gene
+cont <- c("IdhA")
+
+```
+
+# Experimental Set Up
+Goal: This script takes in raw CT values from the ViiA7 system qPCR machine, determines primer efficiency, normalizes samples against a control, and then uses the DeltaDeltaCT method to determine the FC of Targets between conditions. Outputs include a box plot of raw and normalized CT values as well as the FC data. 
+
+Make the following changes to the exported results excel book before running the script...
+
+0. When setting up your experiment on the instrument computer use the "Sample" label to assign descriptive data (WT_300min_A). If you have samples without RT (and thus that you don't want to be included in calculations, use the sample label "NoRT" and they'll be filtered out)
+
+1. Click to the result tab 
+
+2. Select the data rows (not the metadata) and save as .csv
+
+3. If needed add extra descriptive data (dilution, control/exp, plate #, ect)
+
+4. Replace any "Undetermined" values with NA
+
+# Primer efficiency
+
+The first thing we need to check is the efficiency of the primers, in the example data two 10 fold dilutions were prepared from a starting RNA concentration of 50ng/ul. Data should be linear after a log transformation, with a slope ~ -3.3. An efficiency between 0.95-1.05 is considered ideal and 0.90-1.1 acceptable. Outside of that range, you should redesign your primers.
+
+```{r Examine Efficeny Data}
+
+ggplot(eff_data, aes(x=Target.Name, y = CT, color = as.factor(Sample.Name))) +
+         geom_point()
+
+```
+
+We're looking for obvious problems (undiluted samples etc) or problem data points. For example, the final dilution of So4793 is problematic. 
+
+Next let's find the primer efficiencies. We do this using by fitting a linear line to log10 transformed dilutions and then transforming the slope. This script also produces a correlation term, which some papers will report.
+
+```{r Find Primer Efficiency}
+
+## This example has 3 RNA concentrations, If you have more dilutions just add them to the end of the ifelse chain.
+
+eff_data %>% mutate(Dilution = ifelse(Sample.Name == "Dilution1", 1, ifelse(Sample.Name == "Dilution2", 0.1, 0.01))) -> eff_data
+
+## Samples are grouped by Target, and the a linear model used to determine the eff of the primers
+eff_data%>%
+  filter(Sample.Name != "NoRT") %>%
+  nest(data = -Target.Name) %>% 
+  mutate(
+    fit = map(data, ~ lm(CT ~ log10(Dilution), data = .x)),
+    tidied = map(fit, tidy)
+  ) %>% 
+  unnest(tidied) %>%
+  select(Target.Name, term, estimate) %>% 
+  filter(term == "log10(Dilution)")  %>%
+  mutate(primer_eff = (10^(-1/estimate)-1)) -> eff_table
+  eff_table
+  
+eff_data %>% 
+  filter(Sample.Name != "NoRT") %>%
+  group_by(Target.Name) %>%
+  summarize(correlation = cor(CT, log10(Dilution)))
+
+```
+
+Of the genes tested, nc31, R, S, SulA and IdhA have viable efficiencies. The issues with So4793 are likely due to that point we saw in the scatter plot.  
+
+# Experimental Data
+
+Now let's move into the actual experimental data. First, we're going to test the efficiencies of the samples, what we're looking for here is chemical contamination as well as DNA contamination. You only need to run this once per sample preparation, which for the one-step kits means once per DNased sample. This is similar to the primer efficiency section. 
+
+```{r Find Sample Efficiency }
+
+raw_CT %>% filter(Target.Name == cont) %>%
+ggplot(aes(x=Sample.Name, y = CT, color = as.factor(Dilution))) +
+         geom_point() +
+  ggtitle("Raw CT Values")
+
+
+raw_CT %>% filter(Target.Name == cont) %>%
+  
+  filter(Target.Name == cont) %>%
+  drop_na("CT") %>%
+  nest(data = -Sample.Name) %>% 
+  mutate(
+    fit = map(data, ~ lm(CT ~ log10(Dilution), data = .x)),
+    tidied = map(fit, tidy)
+  ) %>% 
+  unnest(tidied) %>%
+  select(Sample.Name, term, estimate) %>% 
+  filter(term == "log10(Dilution)")  %>%
+  mutate(primer_eff = (10^(-1/estimate)-1)) -> eff_table
+  eff_table
+  
+raw_CT %>% 
+  filter(Target.Name==cont) %>%
+  drop_na("CT") %>%
+  group_by(Sample.Name) %>%
+  summarize(correlation = cor(CT, log10(Dilution))) 
+
+
+
+```
+From looking at this, it looks like I miss loaded C_300_40 (since the CT is the same for both 0.01 and 0.1), D_300_0 on the other hand is worrying.
+
+```{r Controls}
+
+## Here we're splitting up the descriptive column (Sample.Name) and tossing out neg controls (IdhA_noRT) and problematic samples (D_300_40). 
+
+raw_CT%>%
+  filter(CT < 30) %>% 
+  filter(Target.Name != "IdhA_noRT") %>%
+  filter(Sample.Name != "D_300_40") %>%
+  filter(Dilution == 1) %>%
+  separate(Sample.Name, into = c("Rep", "Time","Dose"), remove = FALSE) %>%
+  mutate(Dose = as.numeric(Dose)) %>%
+  drop_na(CT) -> tidy_data 
+
+tidy_data %>% 
+  filter(Target.Name == cont) %>%
+  ggplot(aes(Sample.Name, CT, color = Rep)) +
+  geom_point() +
+  ggtitle("Raw CT Values")
+
+```
+
+Looking at the raw control values, by stress you can see that we have a problem.... the control seems to be dependent on dose... which is a big problem. This led me to swtich my control gene to SecA, but for the example, lets just keep moving into the DeltaDelta CT pipeline.
+
+The DeltaDelta CT method involves normalizing the CT of every gene against an internal CT (the first Delta) and then comparing those normalizied Delta's between samples (the second Delta). From that second Delta, a fold change can be found raising 2 to the ddCT. This does assume that you have perfect efficiency and so imperfect efficiency of the primers or of the samples will distort this assumption and possibly lead to a miss leading foldchange. All statistics are conducted on the DeltaCT values, the Foldchange is a way of contextualizing the changes in transcript abundance. 
+
+The use of a Boxplot in this example gives the investigator a better sense of the variability in the data. For actual publication, most people use a bar plot, which is produced below.
+
+```{r Delta Delta CT method}
+
+tidy_data %>%
+  group_by(Sample.Name) %>%
+  mutate(Id_ct = mean(CT[Target.Name == cont])) %>% 
+  group_by(Target.Name) %>%
+  mutate(d_CT = CT-Id_ct) %>%
+  ungroup() %>%
+  group_by(Rep) %>%
+  group_by(Target.Name) %>%
+  mutate(ddCT = (d_CT- (mean(d_CT[Dose == 0])))) %>%  ## This line needs to be changed to reflect your exp set up i.e what is your "baseline" condition
+  mutate(FC = 2^(-ddCT)) -> data
+head(data)
+
+ggplot(data, aes(Target.Name, log2(FC), color = as.factor(Dose))) +
+  geom_boxplot() +
+  theme_minimal() +
+  scale_color_discrete(name = "Dose", labels = c("0", "1", "40")) +
+  ggtitle("Log2FC of Genes Under Stress")
+
+ggplot(data, aes(Target.Name, d_CT, color = as.factor(Dose))) +
+  geom_boxplot() +
+  theme_minimal() +
+  scale_color_discrete(name = "Dose", labels = c("0", "1", "40")) +
+  ggtitle("DeltaDelta CT Values of Genes Under Stress")
+
+```
+
+This is where my ANOVA ideas came from
+
+https://www.researchgate.net/post/when_performing_a_stastical_analysis_on_qPCR_data_where_do_you_apply_ANOVA_or_TTest_on_dct_values_or_fold_change
+
+In this example, we are testing the against the 0 dose. R defaults to testing against 0 in these nested lm(), however, you can manually specify a treatment to compare against. In this example, I am defining a p-value of less than 0.01 as significant.
+
+```{r Testing Sig using ANOVA}
+
+#doi: 10.1186/s12859-017-1949-5
+
+ data  %>%
+  nest(data = -Target.Name) %>% 
+  mutate(
+    fit = map(data, ~ lm(d_CT ~ as.factor(Dose), data = .x)),
+    tidied = map(fit, tidy)
+  ) %>% 
+  unnest(tidied) %>% 
+   filter(term != "(Intercept)") %>%
+   select(Target.Name, term, std.error, estimate, p.value ) -> sig_fc
+  
+ sig_fc
+ 
+ sig_fc %>%
+   mutate(sig = ifelse(p.value < 0.01, "sig", "not_sig")) %>%
+   ggplot(aes(x = Target.Name, y = (-estimate), fill = sig, group_by)) +
+    geom_col() +
+   facet_wrap(~term)
+ 
+tidy(coef(aov(d_CT ~ as.factor(Dose)*Target.Name, data = data))) %>%
+  mutate(sig = ifelse(x < 0.01, "sig", "not_sig"))
+
+
+
+```     
+
+In this final output, the foldchange is presented as a Log2 value, this is often used with transcripts to "equally" display up and downregulation. A log2(FC) of 1 = 2X as much transcript and a log2(FC) 0f -1 = a 50% reduction in transcript. I have not yet found an easy way to add the significance asterisk.
+
+```{r final output}
+
+summary <- data %>%
+  filter(Target.Name != "IdhA") %>%
+  group_by(Dose,Target.Name) %>%
+  summarise(
+    sd = sd(FC, na.rm = TRUE),
+    FC = mean(FC)
+  )
+ 
+ summary %>% filter(Dose != 0) %>%
+   filter(Target.Name != "IdhA") %>%
+   unite(Target.Name:Dose, col= "ID", remove = FALSE) %>%
+   left_join(sig_tidy) %>%
+   mutate(Strain = "WT")-> graph_data
+  
+graph_data %>%
+  ggplot(aes(Target.Name, log2(FC), fill = as.factor(Dose))) +
+  geom_col(position = position_dodge2(preserve = "single")) +
+  geom_errorbar(aes(ymin = log2(FC - sd), ymax = log2(FC+sd)), width = 0.2) +
+  facet_wrap(~Dose) +
+  theme_minimal() +
+  labs(fill="Dose (Gy)") +
+ ylim(-2,6)
+
+
+```
+For the ANOVA output the interaction term between the dose and the target is what we're interested in.
