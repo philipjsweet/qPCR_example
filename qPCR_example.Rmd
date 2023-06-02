@@ -5,11 +5,6 @@ date: "October 28, 2020"
 output: html_document
 ---
 
-if (!requireNamespace("BiocManager", quietly = TRUE))
-    install.packages("BiocManager")
-
-BiocManager::install("HTqPCR")
-
 Undetermiend replaced with NA in the CSV, dilution column also added before importing.
 
 ```{r setup, include=FALSE}
